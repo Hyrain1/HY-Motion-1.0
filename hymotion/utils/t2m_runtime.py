@@ -39,6 +39,26 @@ def _now():
     return time.strftime("%Y%m%d_%H%M%S", time.localtime(t)) + f"{ms:03d}"
 
 
+def _get_device_backend(device_type: Optional[str]):
+    # MUSA builds can expose a CUDA compatibility layer. Prefer the native device.
+    if device_type in (None, "musa"):
+        try:
+            import torch_musa  # Registers the MUSA backend in torch.
+        except ImportError as exc:
+            if device_type == "musa":
+                raise RuntimeError("MUSA requires a compatible torch_musa installation.") from exc
+        else:
+            if torch.musa.is_available():
+                return "musa", torch.musa
+    if device_type in (None, "cuda") and torch.cuda.is_available():
+        return "cuda", torch.cuda
+    if device_type in ("musa", "cuda"):
+        raise RuntimeError(f"No {device_type.upper()} device is available.")
+    if device_type not in (None, "cpu"):
+        raise ValueError(f"Unsupported device type: {device_type}")
+    return "cpu", None
+
+
 class T2MRuntime:
     def __init__(
         self,
@@ -51,6 +71,7 @@ class T2MRuntime:
         disable_prompt_engineering: bool = False,
         prompt_engineering_host: Optional[str] = None,
         prompt_engineering_model_path: Optional[str] = None,
+        device_type: Optional[str] = None,
     ):
         self.config_path = config_path
         self.ckpt_name = ckpt_name
@@ -62,13 +83,15 @@ class T2MRuntime:
         self.local_ip = _get_local_ip()
 
         if force_cpu:
-            print(">>> [INFO] CPU mode enabled via HY_MOTION_DEVICE=cpu environment variable")
-            self.device_ids = []
-        elif torch.cuda.is_available():
-            all_ids = list(range(torch.cuda.device_count()))
-            self.device_ids = all_ids if device_ids is None else [i for i in device_ids if i in all_ids]
-        else:
-            self.device_ids = []
+            device_type = "cpu"
+        backend_name, self._device_backend = _get_device_backend(device_type)
+        all_ids = list(range(self._device_backend.device_count())) if self._device_backend is not None else []
+        self.device_ids = all_ids if device_ids is None else [i for i in device_ids if i in all_ids]
+        if device_type in ("musa", "cuda") and (
+            not self.device_ids or (device_ids is not None and len(self.device_ids) != len(device_ids))
+        ):
+            raise ValueError(f"Invalid {device_type.upper()} device IDs {device_ids}. Available IDs: {all_ids}")
+        self.devices = [torch.device(backend_name, i) for i in self.device_ids] or [torch.device("cpu")]
 
         self.pipelines = []
         self._gpu_load = []
@@ -99,7 +122,7 @@ class T2MRuntime:
             self.fbx_converter = None
             print(">>> FBX module not found. FBX export will be disabled.")
 
-        device_info = self.device_ids if self.device_ids else "cpu"
+        device_info = ", ".join(map(str, self.devices))
         if self.skip_model_loading:
             print(
                 f">>> T2MRuntime initialized (using randomly initialized weights) in IP {self.local_ip}, devices={device_info}"
@@ -115,41 +138,20 @@ class T2MRuntime:
         with open(self.config_path, "r") as f:
             config = yaml.load(f, Loader=yaml.FullLoader)
 
-        # Use allow_empty_ckpt=True when skip_model_loading is True
-        allow_empty_ckpt = self.skip_model_loading
-
-        if not self.device_ids:
+        for device in self.devices:
             pipeline = load_object(
                 config["train_pipeline"],
                 config["train_pipeline_args"],
                 network_module=config["network_module"],
                 network_module_args=config["network_module_args"],
             )
-            device = torch.device("cpu")
             pipeline.load_in_demo(
                 self.ckpt_name,
                 build_text_encoder=not self.skip_text,
-                allow_empty_ckpt=allow_empty_ckpt,
+                allow_empty_ckpt=self.skip_model_loading,
             )
-            pipeline.to(device)
-            self.pipelines = [pipeline]
-            self._gpu_load = [0]
-        else:
-            for gid in self.device_ids:
-                p = load_object(
-                    config["train_pipeline"],
-                    config["train_pipeline_args"],
-                    network_module=config["network_module"],
-                    network_module_args=config["network_module_args"],
-                )
-                p.load_in_demo(
-                    self.ckpt_name,
-                    build_text_encoder=not self.skip_text,
-                    allow_empty_ckpt=allow_empty_ckpt,
-                )
-                p.to(torch.device(f"cuda:{gid}"))
-                self.pipelines.append(p)
-            self._gpu_load = [0] * len(self.pipelines)
+            self.pipelines.append(pipeline.to(device))
+        self._gpu_load = [0] * len(self.pipelines)
 
         self._loaded = True
 
@@ -236,8 +238,8 @@ class T2MRuntime:
             raise
         finally:
             self._release_pipeline(pi)
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            if self.device_ids:
+                self._device_backend.empty_cache()
 
     def load_text_encoder(self) -> None:
         """

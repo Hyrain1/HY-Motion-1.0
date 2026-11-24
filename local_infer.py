@@ -296,6 +296,9 @@ def main():
     parser = argparse.ArgumentParser(description="HY-Motion-1.0 Text-to-Motion Local Infer")
     parser.add_argument("--model_path", type=str, required=True, help="Configuration file path")
     parser.add_argument(
+        "--device", choices=["cpu", "cuda", "musa"], help="Inference device type (default: auto-detect)"
+    )
+    parser.add_argument(
         "--device_ids", type=str, default=None, help="GPU device ID list, separated by commas, e.g.: 0,1,2,3"
     )
     parser.add_argument(
@@ -342,6 +345,7 @@ def main():
         config_path=cfg,
         ckpt_name=ckpt,
         device_ids=device_ids,
+        device_type=args.device,
         disable_prompt_engineering=args.disable_duration_est and args.disable_rewrite,
         prompt_engineering_host=args.prompt_engineering_host,
         prompt_engineering_model_path=args.prompt_engineering_model_path,
